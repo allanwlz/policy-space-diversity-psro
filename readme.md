@@ -20,6 +20,8 @@ To run NMM
 python NMM_train.py
 ```
 
+For poker, see poker/exp.sh
+
 ### Citation
 ```latex
 @inproceedings{yao2023policy,
