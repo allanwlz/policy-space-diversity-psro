@@ -18,7 +18,7 @@ from open_spiel.python.algorithms import lp_solver
 from utils.DQN_agent import DQNAgent
 
 np.set_printoptions(precision=4)
-Transition = namedtuple('Transition', ['state', 'action', "actions_prob", 'a_log_prob', 'reward', 'next_state', 'done', "legal_action"])
+Transition = namedtuple('Transition', ['state', 'action', "actions_prob", 'a_log_prob', 'reward', 'next_state', 'done', "legal_action", "z_index"])
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -33,6 +33,7 @@ def new_agent(game):
                         state_dim=args.OBS_DIM,
                         hidden_dim=args.HIDDEN_DIM,
                         action_dim=args.ACTION_DIM,
+                        z_dim=args.z_dim,
                         device=args.device,
                         ckp_dir="./")
 
@@ -68,6 +69,7 @@ def kl_divergence(prob_a, prob_b):
     
 def simulate_one(algorithm, div_weight, game, oppo_policies, oppo_id_pools, main_agent, buffer_to_add):
     n_steps_rec = [0]
+    z_index = np.random.choice(main_agent.z_dim)
     for oppo_idx in oppo_id_pools:
         # print(oppo_idx)
         oppo_policy = oppo_policies[oppo_idx]
@@ -93,7 +95,7 @@ def simulate_one(algorithm, div_weight, game, oppo_policies, oppo_id_pools, main
                 s = state.information_state_tensor(cur_player)
                 if cur_player == player_train:
                     act_prob_all, action, act_prob = main_agent.select_action(
-                        s, legal_actions)
+                        s, legal_actions, z_index=z_index)
                     obs_list.append(s)
                     act_index_list.append(action)
                     act_prob_list.append(act_prob)
@@ -120,11 +122,11 @@ def simulate_one(algorithm, div_weight, game, oppo_policies, oppo_id_pools, main
         return_list = return_list[::-1]
         for n in range(n_steps):
             if n == n_steps - 1:
-                trans = Transition(obs_list[n], act_index_list[n], act_prob_all_list[n], act_prob_list[n], return_list[n], obs_list[n], 1, legal_action_list[n])
+                trans = Transition(obs_list[n], act_index_list[n], act_prob_all_list[n], act_prob_list[n], return_list[n], obs_list[n], 1, legal_action_list[n], z_index)
             else:
-                trans = Transition(obs_list[n], act_index_list[n], act_prob_all_list[n], act_prob_list[n], return_list[n], obs_list[n+1], 0, legal_action_list[n])
+                trans = Transition(obs_list[n], act_index_list[n], act_prob_all_list[n], act_prob_list[n], return_list[n], obs_list[n+1], 0, legal_action_list[n], z_index)
             buffer_to_add.append(trans)
-    return n_steps_rec
+    return n_steps_rec, z_index
 
 
 class PSD_PSRO_SOLVER(object):
@@ -145,9 +147,12 @@ class PSD_PSRO_SOLVER(object):
         self.total_iters = args.total_iters
         self.oracle_iters = oracle_iters
         self.fsp_eps = 1e-3
+        self.z_dim = args.z_dim
 
-        self.policy_set = [new_agent(self.game)]
-        self.meta_game = np.zeros((1, 1))
+        self.policy_set = [new_agent(self.game) for i in range(self.z_dim)]
+        for i, pol in enumerate(self.policy_set):
+            pol.z_index = i
+        self.meta_game = np.zeros((self.z_dim, self.z_dim))
         self.hist_ne = []
 
         # data record
@@ -157,6 +162,7 @@ class PSD_PSRO_SOLVER(object):
         self.algorithm = args.algorithm
 
         self.div_weight = args.div_weight
+        self.inter_kl_weight = args.inter_kl_weight
 
         DEBUG_ = False
         if DEBUG_:
@@ -244,10 +250,9 @@ class PSD_PSRO_SOLVER(object):
         oppo_id_pools = np.random.choice(len(oppo_policies), p=ne, size=iterations)
         for idx in range(iterations//self.learn_step):
             buffer_to_add = []
-            n_steps_rec = simulate_one(self.algorithm, self.div_weight, self.game,
+            n_steps_rec, z_index = simulate_one(self.algorithm, self.div_weight, self.game,
                                        oppo_policies, oppo_id_pools[idx*self.learn_step:idx*self.learn_step+self.learn_step],
                                        main_agent, buffer_to_add)
-
             if self.algorithm == "psd_psro":
                 states = torch.tensor([trans.state for trans in buffer_to_add]).to(self.device)
                 action_probs = torch.stack([trans.actions_prob for trans in buffer_to_add], axis=0)
@@ -263,9 +268,40 @@ class PSD_PSRO_SOLVER(object):
                     psd_score = kl_sum_all[min_idx,n_steps_rec[n_i]:n_steps_rec[n_i+1]].sum()
                     buffer_to_add[n_steps_rec[n_i+1]-1] = buffer_to_add[n_steps_rec[n_i+1]-1]._replace(
                         reward = buffer_to_add[n_steps_rec[n_i+1]-1].reward + 100 * psd_score * self.div_weight)
-
+            elif self.algorithm == "div_psro" and z_index != 0:
+                states = torch.tensor([trans.state for trans in buffer_to_add]).to(self.device)
+                print([trans.actions_prob.device for trans in buffer_to_add])
+                action_probs = torch.stack([trans.actions_prob for trans in buffer_to_add], axis=0)
+                # Inter Level Div
+                inter_kl_sum_all = []
+                for oppo_pol in oppo_policies:
+                    if oppo_pol.z_index == 0:
+                        with torch.no_grad():
+                            oppo_action_probs = oppo_pol.q_net(states, oppo_pol.z_index)
+                        kl_sum = kl_divergence(action_probs, oppo_action_probs)
+                        inter_kl_sum_all.append(kl_sum)
+                inter_kl_sum_all = torch.stack(inter_kl_sum_all, axis=0)
+                # Intro Level Div
+                intro_kl_sum_all = []
+                for intro_z_index in range(self.z_dim):
+                    if intro_z_index == z_index:
+                        continue
+                    with torch.no_grad():
+                        intro_action_probs = main_agent.q_net(states, intro_z_index)
+                        kl_sum = kl_divergence(action_probs, intro_action_probs)
+                        intro_kl_sum_all.append(kl_sum)
+                intro_kl_sum_all = torch.stack(intro_kl_sum_all, axis=0)
+                inter_kl_score = np.minimum(inter_kl_sum_all - intro_kl_sum_all[0:1], 0).mean(0)
+                intro_kl_score = intro_kl_sum_all.mean(0)
+                for n_i in range(len(n_steps_rec)-1):
+                    div_score = inter_kl_score[n_steps_rec[n_i]:n_steps_rec[n_i+1]].mean(0).sum() * self.inter_kl_weight + intro_kl_score[n_steps_rec[n_i]:n_steps_rec[n_i+1]].mean(0).sum()
+                    print("div_score", 100 * div_score * self.div_weight)
+                    print("rwd", buffer_to_add[n_steps_rec[n_i+1]-1].reward)
+                    buffer_to_add[n_steps_rec[n_i+1]-1] = buffer_to_add[n_steps_rec[n_i+1]-1]._replace(
+                        reward = buffer_to_add[n_steps_rec[n_i+1]-1].reward + 100 * div_score * self.div_weight)
             for trans in buffer_to_add:
                 main_agent.store_transition(trans)
+
             if self.algorithm == "psd_psro":
                 main_agent.update(anchor=oppo_policies[min_idx], div_weight=self.div_weight)
             else:
@@ -325,7 +361,10 @@ class PSD_PSRO_SOLVER(object):
                 self.policy_set[:-1], self.ne, it, main_policy)
             clock_time.append(time.time())
             self.policy_set.pop()
-            self.add_new(copy.deepcopy(main_policy))
+            for z in range(self.z_dim):
+                sub_main_policy = copy.deepcopy(main_policy)
+                sub_main_policy.z_index = z
+                self.add_new(sub_main_policy)
             clock_time.append(time.time())
             it += 1
             print("=====Iter: %d finish, Duration: %.4f minutes" %
@@ -343,15 +382,17 @@ if __name__ == "__main__":
     # multiprocessing.set_start_method("spawn")
     parser = argparse.ArgumentParser(allow_abbrev=True)
     parser.add_argument("--env", default="leduc_poker")
-    parser.add_argument("--algorithm", choices=["psro", "psd_psro"], default="psd_psro")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--algorithm", choices=["psro", "psd_psro", "div_psro"], default="psd_psro")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=123)
 
     parser.add_argument("--sims_per_entry", type=int, default=1000)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--oracle_agent", type=str, default="DQN")
-    parser.add_argument("--total_iters", type=int, default=162)
+    parser.add_argument("--total_iters", type=int, default=1000)
     parser.add_argument("--div_weight", type=float, default=1)
+    parser.add_argument("--z_dim", type=int, default=1)
+    parser.add_argument("--inter_kl_weight", type=float, default=1.0)
 
     args = parser.parse_args()
     args.device = args.device if torch.cuda.is_available() else "cpu"

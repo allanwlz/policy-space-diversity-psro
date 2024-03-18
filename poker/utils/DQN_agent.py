@@ -37,13 +37,15 @@ class DQNAgent(Policy):
     target_update = 5
 
     def __init__(self, game, playerids, state_dim, hidden_dim,
-                 action_dim, device, ckp_dir):
+                 action_dim, device, ckp_dir, z_dim = 1, z_index=0):
 
         super().__init__(game, playerids)
         self.device = device
         self.action_dim = action_dim
-        self.q_net = PolicyNet(state_dim, hidden_dim, action_dim).to(self.device)
-        self.tar_q_net = PolicyNet(state_dim, hidden_dim, action_dim).to(self.device)
+        self.z_dim = z_dim
+        self.z_index = z_index
+        self.q_net = PolicyNet(state_dim, hidden_dim, action_dim, z_dim=z_dim, device=self.device).to(self.device)
+        self.tar_q_net = PolicyNet(state_dim, hidden_dim, action_dim, z_dim=z_dim, device=self.device).to(self.device)
         for param, target_param in zip(self.q_net.parameters(), self.tar_q_net.parameters()):
             target_param.data.copy_(param.data)
             
@@ -62,8 +64,9 @@ class DQNAgent(Policy):
 
         return dict(zip(legal_actions, all_act_probs[legal_actions]))
             
-    def select_action(self, state, legal_actions=None, noise=True):
+    def select_action(self, state, legal_actions=None, noise=True, z_index=None):
         state = torch.tensor(state).unsqueeze(0).to(self.device)
+        z_index = self.z_index if z_index is None else z_index
 
         if noise and (np.random.random() < self.epsilon):
             if not legal_actions is None:
@@ -71,24 +74,23 @@ class DQNAgent(Policy):
             else:
                 action = np.random.randint(self.action_dim)
             action = torch.tensor(action)
-            act_prob = torch.zeros(self.action_dim)
+            act_prob = torch.zeros(self.action_dim, device=self.device)
             act_prob[legal_actions] = 1 / len(legal_actions)
         else:
             if not legal_actions is None:
                 with torch.no_grad():
-                    all_act = self.q_net(state)[0]
+                    all_act = self.q_net(state, z_index)[0]
                 legal_act = torch.ones_like(all_act) * - np.inf
                 legal_act[legal_actions] = all_act[legal_actions]
                 action = legal_act.argmax().item()
 
-                act_prob = torch.zeros_like(all_act)
+                act_prob = torch.zeros_like(all_act,  device=self.device)
                 act_prob[legal_actions] = torch.softmax(all_act[legal_actions], -1)
             else:
                 with torch.no_grad():
-                    logits = self.q_net(state)
+                    logits = self.q_net(state, z_index)
                     act_prob = torch.softmax(logits, -1)
                     action = logits.argmax().item()
-
         return act_prob, action, act_prob[action]
         
     def store_transition(self, transition):
