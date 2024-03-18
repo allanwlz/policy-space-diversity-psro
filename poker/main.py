@@ -270,7 +270,6 @@ class PSD_PSRO_SOLVER(object):
                         reward = buffer_to_add[n_steps_rec[n_i+1]-1].reward + 100 * psd_score * self.div_weight)
             elif self.algorithm == "div_psro" and z_index != 0:
                 states = torch.tensor([trans.state for trans in buffer_to_add]).to(self.device)
-                print([trans.actions_prob.device for trans in buffer_to_add])
                 action_probs = torch.stack([trans.actions_prob for trans in buffer_to_add], axis=0)
                 # Inter Level Div
                 inter_kl_sum_all = []

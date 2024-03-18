@@ -148,8 +148,8 @@ class DQNAgent(Policy):
             dqn_loss.backward()
         self.optimizer.step()
 
-        self.q_net = self.q_net.to("cpu")
-        self.tar_q_net = self.tar_q_net.to("cpu")
+        self.q_net = self.q_net.to(self.device)
+        self.tar_q_net = self.tar_q_net.to(self.device)
         
         self.counter += 1
         if self.counter % self.target_update == 0:
